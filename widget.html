@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Zoho CRM Support Widget</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg-a: #eef4ff;
+      --bg-b: #f7fafc;
+      --bg-c: #edfdf7;
+      --surface: rgba(255, 255, 255, 0.92);
+      --surface-strong: #ffffff;
+      --border: rgba(148, 163, 184, 0.28);
+      --text: #0f172a;
+      --muted: #64748b;
+      --brand: #0f766e;
+      --brand-strong: #115e59;
+      --brand-soft: #e6fffb;
+      --user-bg: #dbeafe;
+      --assistant-bg: #ffffff;
+      --danger: #b91c1c;
+      --shadow: 0 24px 70px rgba(15, 23, 42, 0.12);
+      --shadow-soft: 0 10px 30px rgba(15, 23, 42, 0.08);
+      --radius-xl: 24px;
+      --radius-lg: 18px;
+      --radius-md: 14px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      font-family: Inter, Segoe UI, system-ui, -apple-system, Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(14, 165, 233, 0.16), transparent 28%),
+        radial-gradient(circle at top right, rgba(15, 118, 110, 0.18), transparent 24%),
+        radial-gradient(circle at bottom left, rgba(16, 185, 129, 0.1), transparent 24%),
+        linear-gradient(180deg, var(--bg-a) 0%, var(--bg-b) 45%, #f4f7fb 100%);
+    }
+
+    .widget-shell {
+      display: flex;
+      min-height: 100vh;
+      padding: 16px;
+    }
+
+    .panel {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      max-width: 1024px;
+      margin: 0 auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius-xl) + 4px);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(14px);
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      padding: 20px 22px;
+      background: linear-gradient(135deg, rgba(15, 118, 110, 0.08), rgba(37, 99, 235, 0.05));
+      border-bottom: 1px solid var(--border);
+    }
+
+    .title-wrap h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+
+    .title-wrap p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      max-width: 60ch;
+    }
+
+    .status-pill {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.08);
+      color: var(--brand-strong);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--brand);
+      box-shadow: 0 0 0 6px rgba(15, 118, 110, 0.1);
+    }
+
+    .feed {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      scroll-behavior: smooth;
+    }
+
+    .message {
+      max-width: min(92%, 740px);
+      border-radius: 18px;
+      padding: 14px 16px;
+      line-height: 1.55;
+      word-break: break-word;
+      white-space: pre-wrap;
+      box-shadow: var(--shadow-soft);
+      animation: fadeInUp 0.18s ease-out;
+    }
+
+    .message.user {
+      margin-left: auto;
+      background: linear-gradient(180deg, #e0f2fe 0%, #dbeafe 100%);
+      border: 1px solid rgba(37, 99, 235, 0.14);
+      border-bottom-right-radius: 6px;
+    }
+
+    .message.assistant {
+      margin-right: auto;
+      background: var(--assistant-bg);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 6px;
+    }
+
+    .message.meta {
+      margin: 0 auto;
+      padding: 6px 10px;
+      border: 0;
+      box-shadow: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    .message.typing {
+      font-style: italic;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.75);
+    }
+
+    .assistant-block {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .ticket-panel {
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px 20px 20px;
+      border-top: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.76);
+    }
+
+    .ticket-panel.visible {
+      display: flex;
+    }
+
+    .ticket-callout {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .ticket-callout strong {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 2px;
+    }
+
+    .ticket-callout span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .ticket-button {
+      align-self: flex-start;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border: 0;
+      border-radius: 12px;
+      padding: 11px 14px;
+      background: linear-gradient(180deg, var(--brand) 0%, var(--brand-strong) 100%);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 12px 24px rgba(15, 118, 110, 0.18);
+      transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+    }
+
+    .ticket-button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 16px 28px rgba(15, 118, 110, 0.22);
+    }
+
+    .ticket-button:disabled,
+    .composer-button:disabled,
+    .ticket-form button:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .ticket-form {
+      display: none;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      padding: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .ticket-form.open {
+      display: grid;
+    }
+
+    .field-group {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field-group label {
+      font-size: 12px;
+      font-weight: 700;
+      color: #334155;
+    }
+
+    .field-group input,
+    .field-group textarea {
+      width: 100%;
+      border: 1px solid rgba(148, 163, 184, 0.36);
+      border-radius: 14px;
+      padding: 12px 14px;
+      font-size: 14px;
+      outline: none;
+      background: #fff;
+      color: var(--text);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      font-family: inherit;
+    }
+
+    .field-group textarea {
+      resize: vertical;
+      min-height: 140px;
+    }
+
+    .field-group input:focus,
+    .field-group textarea:focus {
+      border-color: rgba(15, 118, 110, 0.6);
+      box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12);
+    }
+
+    .ticket-form-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .ticket-form button,
+    .ticket-form .secondary-button {
+      border: 0;
+      border-radius: 12px;
+      padding: 11px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+    }
+
+    .ticket-form button:hover,
+    .ticket-form .secondary-button:hover {
+      transform: translateY(-1px);
+    }
+
+    .ticket-form .primary-button {
+      background: linear-gradient(180deg, var(--brand) 0%, var(--brand-strong) 100%);
+      color: #fff;
+    }
+
+    .ticket-form .secondary-button {
+      background: rgba(148, 163, 184, 0.12);
+      color: #334155;
+    }
+
+    .composer {
+      display: flex;
+      gap: 10px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.92);
+      border-top: 1px solid var(--border);
+    }
+
+    .composer-input {
+      flex: 1;
+      border: 1px solid rgba(148, 163, 184, 0.36);
+      border-radius: 14px;
+      padding: 14px 16px;
+      font-size: 14px;
+      outline: none;
+      background: #fff;
+      color: var(--text);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .composer-input:focus {
+      border-color: rgba(15, 118, 110, 0.6);
+      box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12);
+    }
+
+    .composer-button {
+      flex: 0 0 auto;
+      min-width: 120px;
+      border: 0;
+      border-radius: 14px;
+      padding: 0 18px;
+      background: linear-gradient(180deg, var(--brand) 0%, var(--brand-strong) 100%);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+    }
+
+    .composer-button:hover {
+      transform: translateY(-1px);
+    }
+
+    .hint-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .hint-chip {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 999px;
+      padding: 6px 10px;
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(6px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 720px) {
+      .widget-shell {
+        padding: 0;
+      }
+
+      .panel {
+        border-radius: 0;
+        min-height: 100vh;
+      }
+
+      .header {
+        padding: 18px 16px;
+        flex-direction: column;
+      }
+
+      .composer {
+        padding: 12px;
+        flex-direction: column;
+      }
+
+      .composer-button {
+        min-height: 46px;
+      }
+
+      .message {
+        max-width: 100%;
+      }
+
+      .ticket-callout {
+        align-items: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="widget-shell">
+    <div class="panel">
+      <div class="header">
+        <div class="title-wrap">
+          <h1>Zoho CRM Support Assistant</h1>
+          <p>Uses the Zoho CRM JavaScript SDK to read the current record, sends only compact CRM context to the backend, and escalates to Zoho Desk when the conversation stays unresolved.</p>
+        </div>
+        <div class="status-pill" id="statusPill">
+          <span class="status-dot"></span>
+          <span id="statusText">Waiting for PageLoad</span>
+        </div>
+      </div>
+
+      <div id="feed" class="feed" aria-live="polite"></div>
+
+      <div id="ticketPanel" class="ticket-panel">
+        <div class="ticket-callout">
+          <div>
+            <strong>Create a Zoho Desk ticket</strong>
+            <span id="ticketCalloutText">The current thread is still unresolved. You can file a ticket inline without leaving the widget.</span>
+          </div>
+          <button id="ticketButton" class="ticket-button" type="button">Create Ticket</button>
+        </div>
+
+        <form id="ticketForm" class="ticket-form">
+          <div class="field-group">
+            <label for="ticketSubject">Subject</label>
+            <input id="ticketSubject" name="subject" type="text" autocomplete="off" />
+          </div>
+          <div class="field-group">
+            <label for="ticketDescription">Description</label>
+            <textarea id="ticketDescription" name="description"></textarea>
+          </div>
+          <div class="field-group">
+            <label for="ticketEmail">Contact email</label>
+            <input id="ticketEmail" name="contact_email" type="email" autocomplete="email" />
+          </div>
+          <div class="ticket-form-actions">
+            <button id="ticketSubmit" class="primary-button" type="submit">Submit ticket</button>
+            <button id="ticketCancel" class="secondary-button" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="composer">
+        <input id="userInput" class="composer-input" type="text" placeholder="Describe the CRM issue..." autocomplete="off" />
+        <button id="sendButton" class="composer-button" type="button">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://live.zwidgets.com/js-sdk/1.5/ZohoEmbededAppSDK.min.js"></script>
+  <script>
+    const BACKEND_BASE_URL = "https://ai-chatbot-wlk5.onrender.com";
+    const CHAT_ENDPOINT = `${BACKEND_BASE_URL}/chat`;
+    const CREATE_TICKET_ENDPOINT = `${BACKEND_BASE_URL}/create-ticket`;
+    const FRUSTRATION_PHRASES = ["still not working", "that didn't help", "that didnt help", "doesn't help", "does not help"];
+
+    const feed = document.getElementById("feed");
+    const input = document.getElementById("userInput");
+    const sendButton = document.getElementById("sendButton");
+    const statusText = document.getElementById("statusText");
+    const ticketPanel = document.getElementById("ticketPanel");
+    const ticketButton = document.getElementById("ticketButton");
+    const ticketForm = document.getElementById("ticketForm");
+    const ticketSubject = document.getElementById("ticketSubject");
+    const ticketDescription = document.getElementById("ticketDescription");
+    const ticketEmail = document.getElementById("ticketEmail");
+    const ticketSubmit = document.getElementById("ticketSubmit");
+    const ticketCancel = document.getElementById("ticketCancel");
+
+    const fieldMetaCache = new Map();
+
+    const state = {
+      entity: null,
+      currentUser: null,
+      crmContext: null,
+      history: [],
+      lastQuestionNormalized: "",
+      unresolvedCount: 0,
+      ticketPromptVisible: false,
+      lastUnresolvedQuestion: "",
+      lastTicketTriggerReason: "",
+    };
+
+    function scrollToBottom() {
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    function setStatus(message) {
+      statusText.textContent = message;
+    }
+
+    function normalizeText(value) {
+      return String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, "")
+        .replace(/\s+/g, " ");
+    }
+
+    function isRepeatedQuestion(currentQuestion) {
+      const normalized = normalizeText(currentQuestion);
+      return Boolean(normalized) && normalized === state.lastQuestionNormalized;
+    }
+
+    function hasFrustrationPhrase(text) {
+      const normalized = normalizeText(text);
+      return FRUSTRATION_PHRASES.some((phrase) => normalized.includes(phrase));
+    }
+
+    function stringifyValue(value) {
+      if (value === null || value === undefined) {
+        return "";
+      }
+
+      if (Array.isArray(value)) {
+        const items = value
+          .map((item) => stringifyValue(item))
+          .filter(Boolean);
+        return items.join(", ");
+      }
+
+      if (typeof value === "object") {
+        if (typeof value.id !== "undefined" && typeof value.name !== "undefined") {
+          return `${value.name} (${value.id})`;
+        }
+
+        if (typeof value.name !== "undefined") {
+          return String(value.name);
+        }
+
+        if (typeof value.label !== "undefined") {
+          return String(value.label);
+        }
+
+        try {
+          return JSON.stringify(value);
+        } catch (error) {
+          return String(value);
+        }
+      }
+
+      return String(value).trim();
+    }
+
+    function truncateText(value, limit = 160) {
+      const text = stringifyValue(value);
+      if (text.length <= limit) {
+        return text;
+      }
+      return `${text.slice(0, limit - 1)}…`;
+    }
+
+    function appendMessage(role, text, extraClass = "") {
+      const bubble = document.createElement("div");
+      bubble.className = `message ${role}${extraClass ? ` ${extraClass}` : ""}`;
+      bubble.textContent = text;
+      feed.appendChild(bubble);
+      scrollToBottom();
+      return bubble;
+    }
+
+    function appendAssistantBlock(text) {
+      const bubble = document.createElement("div");
+      bubble.className = "message assistant";
+
+      const body = document.createElement("div");
+      body.className = "assistant-block";
+
+      const content = document.createElement("div");
+      content.textContent = text;
+      body.appendChild(content);
+
+      bubble.appendChild(body);
+      feed.appendChild(bubble);
+      scrollToBottom();
+      return { bubble, body, content };
+    }
+
+    function appendMetaMessage(text) {
+      return appendMessage("meta", text);
+    }
+
+    function buildCompactFieldSummary(fieldMeta, record) {
+      const summary = [];
+      const fields = Array.isArray(fieldMeta) ? fieldMeta : [];
+
+      for (const field of fields) {
+        if (!field || typeof field !== "object") {
+          continue;
+        }
+
+        const apiName = field.api_name || field.apiName || field.field_api_name || field.name;
+        if (!apiName || typeof record?.[apiName] === "undefined" || record?.[apiName] === null || record?.[apiName] === "") {
+          continue;
+        }
+
+        summary.push({
+          api_name: apiName,
+          label: field.field_label || field.label || field.display_label || apiName,
+          type: field.data_type || field.type || field.view_type || "unknown",
+          value: truncateText(record[apiName]),
+        });
+
+        if (summary.length >= 18) {
+          break;
+        }
+      }
+
+      if (!summary.length && record && typeof record === "object") {
+        for (const [key, value] of Object.entries(record)) {
+          if (value === null || value === undefined || value === "") {
+            continue;
+          }
+          summary.push({
+            api_name: key,
+            label: key,
+            type: typeof value,
+            value: truncateText(value),
+          });
+          if (summary.length >= 18) {
+            break;
+          }
+        }
+      }
+
+      return summary;
+    }
+
+    function summarizeCurrentUser(user) {
+      if (!user || typeof user !== "object") {
+        return {};
+      }
+
+      const summary = {};
+      const name = user.full_name || user.Full_Name || user.name || user.Name || user.display_name;
+      const email = user.email || user.Email || user.mail || user.primary_email;
+      const id = user.id || user.user_id || user.userId;
+
+      if (name) {
+        summary.name = stringifyValue(name);
+      }
+      if (email) {
+        summary.email = stringifyValue(email);
+      }
+      if (id) {
+        summary.id = stringifyValue(id);
+      }
+
+      return summary;
+    }
+
+    function summarizeCurrentRecord(record, fields, entityName, recordId) {
+      const fieldSummary = buildCompactFieldSummary(fields, record);
+      const recordLabel = record?.Name || record?.name || record?.Subject || record?.subject || record?.title || record?.Title || recordId;
+
+      return {
+        entity: entityName,
+        record_id: recordId,
+        record_label: recordLabel ? stringifyValue(recordLabel) : "",
+        fields: fieldSummary,
+      };
+    }
+
+    async function getCurrentUser() {
+      if (state.currentUser) {
+        return state.currentUser;
+      }
+
+      try {
+        if (window.ZOHO?.CRM?.CONFIG?.getCurrentUser) {
+          const response = await ZOHO.CRM.CONFIG.getCurrentUser();
+          state.currentUser = response?.users?.[0] || response?.data?.[0] || response?.user || response || {};
+        }
+      } catch (error) {
+        state.currentUser = {};
+      }
+
+      return state.currentUser;
+    }
+
+    async function getFieldMeta(entityName) {
+      if (fieldMetaCache.has(entityName)) {
+        return fieldMetaCache.get(entityName);
+      }
+
+      let fields = [];
+      try {
+        const response = await ZOHO.CRM.META.getFields({ Entity: entityName });
+        fields = response?.fields || response?.data || response || [];
+      } catch (error) {
+        fields = [];
+      }
+
+      fieldMetaCache.set(entityName, fields);
+      return fields;
+    }
+
+    async function getRecord(entityName, recordId) {
+      const response = await ZOHO.CRM.API.getRecord({ Entity: entityName, RecordID: recordId });
+      return response?.data?.[0] || response?.data || response?.record || response || {};
+    }
+
+    async function buildCrmContext(entity) {
+      const entityName = entity?.Entity || entity?.entity || entity?.module || "";
+      const recordId = Array.isArray(entity?.EntityId) ? entity.EntityId[0] : entity?.EntityId || entity?.recordId || entity?.id || "";
+      const [record, fields, currentUser] = await Promise.all([
+        recordId ? getRecord(entityName, recordId) : Promise.resolve({}),
+        getFieldMeta(entityName),
+        getCurrentUser(),
+      ]);
+
+      return {
+        entity: entityName,
+        record_id: recordId,
+        current_user: summarizeCurrentUser(currentUser),
+        module_meta: {
+          field_count: Array.isArray(fields) ? fields.length : 0,
+          fields: buildCompactFieldSummary(fields, record),
+        },
+        record: summarizeCurrentRecord(record, fields, entityName, recordId),
+      };
+    }
+
+    function transcriptToText() {
+      if (!state.history.length) {
+        return "";
+      }
+
+      return state.history
+        .map((item) => `${item.role === "user" ? "User" : "Assistant"}: ${item.content}`)
+        .join("\n\n");
+    }
+
+    function syncTicketFormDefaults(question, assistantText = "") {
+      const currentUser = state.currentUser || {};
+      const email = currentUser.email || currentUser.Email || currentUser.mail || currentUser.primary_email || "";
+      const fallbackSubject = question || state.lastUnresolvedQuestion || "CRM support request";
+      const description = transcriptToText();
+
+      ticketSubject.value = fallbackSubject;
+      ticketDescription.value = description || assistantText || fallbackSubject;
+      ticketEmail.value = email;
+    }
+
+    function showTicketPrompt(reason = "") {
+      state.ticketPromptVisible = true;
+      state.lastTicketTriggerReason = reason;
+      ticketPanel.classList.add("visible");
+
+      const note = reason
+        ? `Create Ticket is available because ${reason}.`
+        : "Create Ticket is available for this thread.";
+      document.getElementById("ticketCalloutText").textContent = note;
+    }
+
+    function openTicketForm(question = "") {
+      syncTicketFormDefaults(question);
+      ticketForm.classList.add("open");
+      ticketSubject.focus();
+    }
+
+    function closeTicketForm() {
+      ticketForm.classList.remove("open");
+    }
+
+    function shouldRevealTicketPrompt(resolved, repeatedNow, frustrationNow) {
+      if (frustrationNow) {
+        return "the user entered a frustration phrase";
+      }
+
+      if (repeatedNow) {
+        return "the same question was asked twice in a row";
+      }
+
+      if (resolved === false && state.unresolvedCount >= 2) {
+        return "the session has had two unresolved answers";
+      }
+
+      return "";
+    }
+
+    function commitQuestion(question) {
+      state.lastQuestionNormalized = normalizeText(question);
+    }
+
+    async function sendChatMessage() {
+      const question = input.value.trim();
+      if (!question) {
+        return;
+      }
+
+      const repeatedNow = isRepeatedQuestion(question);
+      const frustrationNow = hasFrustrationPhrase(question);
+      input.value = "";
+      sendButton.disabled = true;
+      appendMessage("user", question);
+      state.history.push({ role: "user", content: question });
+
+      const typingBubble = appendMessage("assistant", "Reviewing live Zoho CRM context...", "typing");
+
+      try {
+        if (!state.entity) {
+          throw new Error("Zoho PageLoad has not been received yet.");
+        }
+
+        if (!state.crmContext) {
+          state.crmContext = await buildCrmContext(state.entity);
+        }
+
+        const response = await fetch(CHAT_ENDPOINT, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            question,
+            crm_context: state.crmContext,
+            history: state.history,
+          }),
+        });
+
+        let data = {};
+        try {
+          data = await response.json();
+        } catch (error) {
+          data = {};
+        }
+
+        typingBubble.remove();
+
+        if (!response.ok) {
+          throw new Error(data?.error || data?.detail || `Chat request failed with status ${response.status}`);
+        }
+
+        const answer = String(data.answer || "I don't know based on the provided CRM data.").trim();
+        const resolved = Boolean(data.resolved);
+
+        appendAssistantBlock(answer);
+        state.history.push({ role: "assistant", content: answer });
+
+        if (!resolved) {
+          state.unresolvedCount += 1;
+          state.lastUnresolvedQuestion = question;
+        }
+
+        const reason = shouldRevealTicketPrompt(resolved, repeatedNow, frustrationNow);
+        if (!state.ticketPromptVisible && reason) {
+          showTicketPrompt(reason);
+        }
+
+        if (state.ticketPromptVisible) {
+          syncTicketFormDefaults(state.lastUnresolvedQuestion || question, answer);
+        }
+
+        commitQuestion(question);
+      } catch (error) {
+        typingBubble.remove();
+        appendMessage("assistant", `Request failed: ${error?.message || error}`);
+        commitQuestion(question);
+      } finally {
+        sendButton.disabled = false;
+        input.focus();
+      }
+    }
+
+    async function submitTicket(event) {
+      event.preventDefault();
+      if (!state.ticketPromptVisible) {
+        return;
+      }
+
+      ticketSubmit.disabled = true;
+      ticketButton.disabled = true;
+
+      try {
+        const subject = ticketSubject.value.trim();
+        const description = ticketDescription.value.trim();
+        const contactEmail = ticketEmail.value.trim();
+
+        if (!subject || !description || !contactEmail) {
+          throw new Error("Subject, description, and contact email are required.");
+        }
+
+        const response = await fetch(CREATE_TICKET_ENDPOINT, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            subject,
+            description,
+            contact_email: contactEmail,
+          }),
+        });
+
+        let data = {};
+        try {
+          data = await response.json();
+        } catch (error) {
+          data = {};
+        }
+
+        if (!response.ok) {
+          throw new Error(data?.error || data?.detail || `Ticket request failed with status ${response.status}`);
+        }
+
+        const ticketNumber = data.ticket_number || data.ticket_id || "the created ticket";
+        appendMessage("assistant", `Ticket created successfully: ${ticketNumber}`);
+        state.unresolvedCount = 0;
+        state.lastUnresolvedQuestion = "";
+        closeTicketForm();
+      } catch (error) {
+        appendMessage("assistant", `Ticket creation failed: ${error?.message || error}`);
+      } finally {
+        ticketSubmit.disabled = false;
+        ticketButton.disabled = false;
+      }
+    }
+
+    ticketButton.addEventListener("click", () => {
+      openTicketForm(state.lastUnresolvedQuestion || input.value.trim() || "CRM support request");
+    });
+
+    ticketCancel.addEventListener("click", () => {
+      closeTicketForm();
+    });
+
+    ticketForm.addEventListener("submit", submitTicket);
+
+    sendButton.addEventListener("click", sendChatMessage);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        sendChatMessage();
+      }
+    });
+
+    if (window.ZOHO?.embeddedApp) {
+      ZOHO.embeddedApp.on("PageLoad", async function (entity) {
+        try {
+          state.entity = entity || {};
+          setStatus("Loading CRM context");
+          state.crmContext = await buildCrmContext(state.entity);
+          setStatus(`Loaded ${state.crmContext.entity || "record"}`);
+          appendMetaMessage("Zoho PageLoad initialized. Live CRM context is ready.");
+        } catch (error) {
+          setStatus("CRM context unavailable");
+          appendMetaMessage(`Could not load CRM context: ${error?.message || error}`);
+        }
+      });
+
+      ZOHO.embeddedApp.init();
+    } else {
+      setStatus("Zoho SDK missing");
+      appendMetaMessage("Open this widget inside Zoho CRM to use the embedded SDK.");
+    }
+
+    appendAssistantBlock("Ask a CRM question. I will use the current record context first and only escalate when the thread stays unresolved.");
+  </script>
+</body>
+</html>
