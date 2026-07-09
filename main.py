@@ -32,15 +32,17 @@ app = FastAPI(
 )
 
 allowed_origin = os.getenv("ALLOWED_ORIGIN", "").strip()
-cors_origins = [origin.strip() for origin in allowed_origin.split(",") if origin.strip()]
-if cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+print("=" * 60)
+print("ALLOWED_ORIGIN raw env value =", repr(allowed_origin))
+print("=" * 60)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # In-memory cache for the Zoho Desk access token so we don't need to
 # hand-paste a fresh token from the console every ~10 minutes.
