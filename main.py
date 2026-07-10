@@ -23,12 +23,14 @@ DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_DESK_BASE_URL = "https://desk.zoho.in/api/v1"
 DEFAULT_ZOHO_OAUTH_TOKEN_URL = "https://accounts.zoho.in/oauth/v2/token"
+DEFAULT_SERPER_ENDPOINT = "https://google.serper.dev/search"
+MAX_TOOL_CALL_ROUNDS = 4
 
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 app = FastAPI(
     title="Zoho CRM Widget AI Backend",
-    version="2.1.0",
+    version="3.0.0",
 )
 
 allowed_origin = os.getenv("ALLOWED_ORIGIN", "").strip()
@@ -113,12 +115,83 @@ def normalize_history(history: list[HistoryMessage]) -> list[dict[str, str]]:
     return [{"role": item.role, "content": item.content} for item in history]
 
 
-def build_chat_messages(question: str, crm_context: dict[str, Any], history: list[HistoryMessage]) -> list[dict[str, str]]:
+# ---------------------------------------------------------------------------
+# Tool: live Zoho CRM documentation search
+# ---------------------------------------------------------------------------
+
+ZOHO_DOCS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_zoho_docs",
+        "description": (
+            "Search Zoho CRM's official help documentation for general how-to and configuration "
+            "questions (e.g. workflow rules, roles, sharing rules, field types) that are not answered "
+            "by the current record's data."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query, e.g. 'how to create a workflow rule'",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def search_zoho_docs(query: str) -> str:
+    api_key = load_env_value("SERPER_API_KEY")
+    if not api_key:
+        return "Documentation search is not configured on this server."
+
+    try:
+        response = requests.post(
+            DEFAULT_SERPER_ENDPOINT,
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": f"site:zoho.com/crm/help {query}"},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        return f"Documentation search failed: {e}"
+
+    if not response.ok:
+        return f"Documentation search failed: {response.status_code}"
+
+    results = response.json().get("organic", [])[:3]
+    if not results:
+        return "No relevant documentation found for this query."
+
+    return "\n\n".join(
+        f"{r.get('title', '')}: {r.get('snippet', '')} ({r.get('link', '')})" for r in results
+    )
+
+
+def execute_tool_call(name: str, arguments: dict[str, Any]) -> str:
+    if name == "search_zoho_docs":
+        return search_zoho_docs(arguments.get("query", ""))
+    return f"Unknown tool: {name}"
+
+
+# ---------------------------------------------------------------------------
+# Groq chat completion with tool-calling
+# ---------------------------------------------------------------------------
+
+def build_chat_messages(question: str, crm_context: dict[str, Any], history: list[HistoryMessage]) -> list[dict[str, Any]]:
     system_prompt = (
-        "You are a support assistant for our Zoho CRM users. Only answer using the CRM data/config JSON provided below. "
-        "If the answer isn't contained in it, say you don't know — never guess or invent field names, values, or configuration details. "
-        'Respond in strict JSON with the shape {"answer": str, "resolved": bool}. '
-        "Keep the answer concise and factual."
+        "You are a support assistant for our Zoho CRM users. "
+        "For greetings, small talk, or questions about what you can help with, respond naturally and briefly "
+        "explain you can answer questions about the current CRM record and general CRM configuration topics — "
+        "mark these as resolved: true. "
+        "For questions about the current record, use the CRM context JSON provided below. "
+        "For general 'how do I configure/use X in Zoho CRM' questions not answered by the record context, "
+        "call the search_zoho_docs tool to find the real answer before responding — do not guess. "
+        "Never invent CRM facts, field names, or configuration details. If a factual question remains "
+        "unanswered after checking context and searching docs, say you don't know and mark resolved: false. "
+        'Once you have a final answer, respond in strict JSON with the shape {"answer": str, "resolved": bool}. '
+        "Keep the answer concise."
     )
 
     user_prompt = [
@@ -179,40 +252,66 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
         raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
 
     model_name = load_env_value("GROQ_MODEL", DEFAULT_GROQ_MODEL) or DEFAULT_GROQ_MODEL
-    response = requests.post(
-        DEFAULT_GROQ_ENDPOINT,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json={
-            "model": model_name,
-            "messages": build_chat_messages(question, crm_context, history),
-            "temperature": 0.2,
-        },
-        timeout=45,
-    )
+    messages: list[dict[str, Any]] = build_chat_messages(question, crm_context, history)
 
-    if not response.ok:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Groq request failed: {response.status_code} {response.text}",
+    for _ in range(MAX_TOOL_CALL_ROUNDS):
+        response = requests.post(
+            DEFAULT_GROQ_ENDPOINT,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json={
+                "model": model_name,
+                "messages": messages,
+                "tools": [ZOHO_DOCS_TOOL],
+                "temperature": 0.2,
+            },
+            timeout=45,
         )
 
-    payload = response.json()
-    choices = payload.get("choices") if isinstance(payload, dict) else None
-    if not isinstance(choices, list) or not choices:
-        raise HTTPException(status_code=500, detail="Groq response did not include any choices")
+        if not response.ok:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Groq request failed: {response.status_code} {response.text}",
+            )
 
-    choice = choices[0]
-    message = choice.get("message", {}) if isinstance(choice, dict) else {}
-    content = first_present(message if isinstance(message, dict) else {}, ("content",))
+        payload = response.json()
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise HTTPException(status_code=500, detail="Groq response did not include any choices")
 
-    if not isinstance(content, str):
-        raise HTTPException(status_code=500, detail="Groq response did not include message content")
+        choice = choices[0]
+        message = choice.get("message", {}) if isinstance(choice, dict) else {}
+        tool_calls = message.get("tool_calls")
 
-    return parse_chat_response(content)
+        if not tool_calls:
+            content = first_present(message if isinstance(message, dict) else {}, ("content",))
+            if not isinstance(content, str):
+                raise HTTPException(status_code=500, detail="Groq response did not include message content")
+            return parse_chat_response(content)
+
+        # Model wants to call a tool: append its request, execute, append the result, loop again.
+        messages.append(message)
+        for call in tool_calls:
+            function_info = call.get("function", {})
+            tool_name = function_info.get("name", "")
+            try:
+                tool_args = json.loads(function_info.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                tool_args = {}
+
+            tool_result = execute_tool_call(tool_name, tool_args)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": tool_result,
+                }
+            )
+
+    raise HTTPException(status_code=500, detail="Too many tool-call rounds without a final answer")
 
 
 def refresh_zoho_access_token() -> None:
@@ -438,6 +537,11 @@ def create_desk_ticket(subject: str, description: str, contact_email: str, depar
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {"service": "Zoho CRM Widget AI Backend", "status": "running", "docs": "/health for status check"}
+
 
 @app.get("/health")
 async def health_check() -> dict[str, str]:
