@@ -183,15 +183,16 @@ def build_chat_messages(question: str, crm_context: dict[str, Any], history: lis
     system_prompt = (
         "You are a support assistant for our Zoho CRM users. "
         "For greetings, small talk, or questions about what you can help with, respond naturally and briefly "
-        "explain you can answer questions about the current CRM record and general CRM configuration topics — "
-        "mark these as resolved: true. "
+        "explain you can answer questions about the current CRM record and general CRM configuration topics. "
         "For questions about the current record, use the CRM context JSON provided below. "
         "For general 'how do I configure/use X in Zoho CRM' questions not answered by the record context, "
         "call the search_zoho_docs tool to find the real answer before responding — do not guess. "
         "Never invent CRM facts, field names, or configuration details. If a factual question remains "
-        "unanswered after checking context and searching docs, say you don't know and mark resolved: false. "
-        'Once you have a final answer, respond in strict JSON with the shape {"answer": str, "resolved": bool}. '
-        "Keep the answer concise."
+        "unanswered after checking context and searching docs, say you don't know. "
+        "Give your final answer as plain text, not JSON or any structured format. "
+        "On the very last line of your final answer, write exactly RESOLVED: true if your answer fully "
+        "addresses the question, or RESOLVED: false if it does not (e.g. you said you don't know, or the "
+        "request needs a human/support action you cannot perform)."
     )
 
     user_prompt = [
@@ -206,44 +207,19 @@ def build_chat_messages(question: str, crm_context: dict[str, Any], history: lis
     ]
 
 
-def extract_json_candidate(text: str) -> Optional[str]:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
-        stripped = re.sub(r"\s*```$", "", stripped)
-
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-
-    return stripped[start : end + 1]
-
-
 def parse_chat_response(content: str) -> dict[str, Any]:
-    fallback = {"answer": safe_strip(content) or "I don't know based on the provided CRM data.", "resolved": False}
-    candidate = extract_json_candidate(content)
-    if not candidate:
-        return fallback
+    text = content.strip()
+    resolved = False
 
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return fallback
+    match = re.search(r"RESOLVED:\s*(true|false)\s*$", text, flags=re.IGNORECASE)
+    if match:
+        resolved = match.group(1).lower() == "true"
+        text = text[: match.start()].strip()
 
-    if not isinstance(parsed, dict):
-        return fallback
+    if not text:
+        text = "I don't know based on the provided CRM data."
 
-    answer = parsed.get("answer")
-    resolved = parsed.get("resolved")
-
-    if not isinstance(answer, str) or not answer.strip():
-        answer = fallback["answer"]
-
-    if not isinstance(resolved, bool):
-        resolved = bool(resolved) if isinstance(resolved, (int, float)) else False
-
-    return {"answer": answer.strip(), "resolved": resolved}
+    return {"answer": text, "resolved": resolved}
 
 
 def groq_chat_completion(question: str, crm_context: dict[str, Any], history: list[HistoryMessage]) -> dict[str, Any]:
@@ -294,8 +270,6 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
 
         # Model wants to call a tool: append its request, execute, append the result, loop again.
         messages.append(message)
-        final_answer: Optional[dict[str, Any]] = None
-
         for call in tool_calls:
             function_info = call.get("function", {})
             tool_name = function_info.get("name", "")
@@ -303,20 +277,6 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
                 tool_args = json.loads(function_info.get("arguments") or "{}")
             except json.JSONDecodeError:
                 tool_args = {}
-
-            # Some models occasionally emit their final structured answer as a fake
-            # tool call (commonly named "json") instead of returning plain content
-            # when tools + strict-JSON-output are both requested. Detect and unwrap
-            # this instead of trying to execute it as a real tool.
-            if tool_name != "search_zoho_docs" and isinstance(tool_args.get("answer"), str):
-                resolved = tool_args.get("resolved")
-                final_answer = {
-                    "answer": tool_args["answer"].strip(),
-                    "resolved": bool(resolved) if isinstance(resolved, bool) else False,
-                }
-                # Still need to satisfy the API's requirement that every tool call gets a result message.
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": "ok"})
-                continue
 
             tool_result = execute_tool_call(tool_name, tool_args)
             messages.append(
@@ -326,9 +286,6 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
                     "content": tool_result,
                 }
             )
-
-        if final_answer is not None:
-            return final_answer
 
     raise HTTPException(status_code=500, detail="Too many tool-call rounds without a final answer")
 
