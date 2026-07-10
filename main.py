@@ -294,6 +294,8 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
 
         # Model wants to call a tool: append its request, execute, append the result, loop again.
         messages.append(message)
+        final_answer: Optional[dict[str, Any]] = None
+
         for call in tool_calls:
             function_info = call.get("function", {})
             tool_name = function_info.get("name", "")
@@ -301,6 +303,20 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
                 tool_args = json.loads(function_info.get("arguments") or "{}")
             except json.JSONDecodeError:
                 tool_args = {}
+
+            # Some models occasionally emit their final structured answer as a fake
+            # tool call (commonly named "json") instead of returning plain content
+            # when tools + strict-JSON-output are both requested. Detect and unwrap
+            # this instead of trying to execute it as a real tool.
+            if tool_name != "search_zoho_docs" and isinstance(tool_args.get("answer"), str):
+                resolved = tool_args.get("resolved")
+                final_answer = {
+                    "answer": tool_args["answer"].strip(),
+                    "resolved": bool(resolved) if isinstance(resolved, bool) else False,
+                }
+                # Still need to satisfy the API's requirement that every tool call gets a result message.
+                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": "ok"})
+                continue
 
             tool_result = execute_tool_call(tool_name, tool_args)
             messages.append(
@@ -310,6 +326,9 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
                     "content": tool_result,
                 }
             )
+
+        if final_answer is not None:
+            return final_answer
 
     raise HTTPException(status_code=500, detail="Too many tool-call rounds without a final answer")
 
