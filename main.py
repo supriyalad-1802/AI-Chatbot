@@ -3,7 +3,6 @@
 import json
 import os
 import re
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -113,7 +112,8 @@ def first_present(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def normalize_history(history: list[HistoryMessage]) -> list[dict[str, str]]:
-    return [{"role": item.role, "content": item.content} for item in history]
+    trimmed = history[-6:]  # keep token usage down; recent context is what matters most
+    return [{"role": item.role, "content": item.content} for item in trimmed]
 
 
 # ---------------------------------------------------------------------------
@@ -232,21 +232,31 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
     messages: list[dict[str, Any]] = build_chat_messages(question, crm_context, history)
 
     for _ in range(MAX_TOOL_CALL_ROUNDS):
-        response = requests.post(
-            DEFAULT_GROQ_ENDPOINT,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            json={
-                "model": model_name,
-                "messages": messages,
-                "tools": [ZOHO_DOCS_TOOL],
-                "temperature": 0.2,
-            },
-            timeout=45,
-        )
+        response = None
+        for attempt in range(6):
+            response = requests.post(
+                DEFAULT_GROQ_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={
+                    "model": model_name,
+                    "messages": messages,
+                    "tools": [ZOHO_DOCS_TOOL],
+                    "temperature": 0.2,
+                },
+                timeout=45,
+            )
+            if response.status_code != 429:
+                break
+            retry_after = 3.0 * (attempt + 1)
+            try:
+                retry_after = float(response.json().get("error", {}).get("message", "").split("in ")[-1].rstrip("s")) + 0.5
+            except (ValueError, IndexError, AttributeError):
+                pass
+            time.sleep(min(retry_after, 20.0))
 
         if not response.ok:
             raise HTTPException(
