@@ -20,7 +20,7 @@ ENV_PATH = BASE_DIR / ".env"
 # NOTE: llama-3.3-70b-versatile was deprecated by Groq on 2026-06-17.
 # openai/gpt-oss-120b is the recommended replacement for general-purpose use.
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_GROQ_ENDPOINT = "https://api.cerebras.ai/v1/chat/completions"
 DEFAULT_DESK_BASE_URL = "https://desk.zoho.in/api/v1"
 DEFAULT_ZOHO_OAUTH_TOKEN_URL = "https://accounts.zoho.in/oauth/v2/token"
 DEFAULT_SERPER_ENDPOINT = "https://google.serper.dev/search"
@@ -33,16 +33,13 @@ app = FastAPI(
     version="3.0.0",
 )
 
-allowed_origin = os.getenv("ALLOWED_ORIGIN", "").strip()
-cors_origins = [origin.strip() for origin in allowed_origin.split(",") if origin.strip()]
-if cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # In-memory cache for the Zoho Desk access token so we don't need to
 # hand-paste a fresh token from the console every ~10 minutes.
@@ -93,7 +90,11 @@ def load_env_value(name: str, default: Optional[str] = None) -> Optional[str]:
     return value
 
 
-def json_dumps_compact(value: Any) -> str:
+def safe_json(response: requests.Response) -> Optional[Any]:
+    try:
+        return response.json()
+    except ValueError:
+        return None
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False)
 
 
@@ -224,9 +225,9 @@ def parse_chat_response(content: str) -> dict[str, Any]:
 
 
 def groq_chat_completion(question: str, crm_context: dict[str, Any], history: list[HistoryMessage]) -> dict[str, Any]:
-    api_key = load_env_value("GROQ_API_KEY")
+    api_key = load_env_value("CEREBRAS_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
+        raise HTTPException(status_code=500, detail="CEREBRAS_API_KEY is not configured")
 
     model_name = load_env_value("GROQ_MODEL", DEFAULT_GROQ_MODEL) or DEFAULT_GROQ_MODEL
     messages: list[dict[str, Any]] = build_chat_messages(question, crm_context, history)
@@ -251,12 +252,7 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
             )
             if response.status_code != 429:
                 break
-            retry_after = 3.0 * (attempt + 1)
-            try:
-                retry_after = float(response.json().get("error", {}).get("message", "").split("in ")[-1].rstrip("s")) + 0.5
-            except (ValueError, IndexError, AttributeError):
-                pass
-            time.sleep(min(retry_after, 20.0))
+            time.sleep(min(parse_retry_after_seconds(response, default=3.0 * (attempt + 1)), 20.0))
 
         if not response.ok:
             raise HTTPException(
@@ -301,7 +297,10 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
     raise HTTPException(status_code=500, detail="Too many tool-call rounds without a final answer")
 
 
-def refresh_zoho_access_token() -> None:
+def parse_retry_after_seconds(response: requests.Response, default: float) -> float:
+    message = (safe_json(response) or {}).get("error", {}).get("message", "")
+    match = re.search(r"try again in ([\d.]+)s", message)
+    return float(match.group(1)) + 0.5 if match else default
     """Exchange the long-lived refresh token for a fresh short-lived access token
     and cache it in memory along with its expiry time."""
     global _current_access_token, _token_expiry_time
@@ -406,10 +405,8 @@ def search_desk_contact(contact_email: str) -> Optional[str]:
             detail=f"Zoho Desk contact search failed: {response.status_code} {response.text}",
         )
 
-    try:
-        payload = response.json()
-    except ValueError:
-        # Empty body or non-JSON response (e.g. no results) — treat as "no match found".
+    payload = safe_json(response)
+    if payload is None:
         return None
 
     candidates: list[Any] = []
@@ -454,9 +451,8 @@ def create_desk_contact(contact_email: str) -> str:
             detail=f"Zoho Desk contact creation failed: {response.status_code} {response.text}",
         )
 
-    try:
-        payload = response.json()
-    except ValueError:
+    payload = safe_json(response)
+    if payload is None:
         raise HTTPException(
             status_code=500,
             detail=f"Zoho Desk contact creation returned a non-JSON response: {response.text}",
@@ -502,9 +498,8 @@ def create_desk_ticket(subject: str, description: str, contact_email: str, depar
             detail=f"Zoho Desk ticket creation failed: {response.status_code} {response.text}",
         )
 
-    try:
-        payload = response.json()
-    except ValueError:
+    payload = safe_json(response)
+    if payload is None:
         raise HTTPException(
             status_code=500,
             detail=f"Zoho Desk ticket creation returned a non-JSON response: {response.text}",
