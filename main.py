@@ -98,6 +98,10 @@ def safe_json(response: requests.Response) -> Optional[Any]:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False)
 
 
+def json_dumps_compact(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False)
+
+
 def safe_strip(value: Any) -> str:
     if value is None:
         return ""
