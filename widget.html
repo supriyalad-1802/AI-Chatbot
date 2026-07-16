@@ -819,6 +819,9 @@
       if (!question) {
         return;
       }
+      if (!state.entity) {
+  throw new Error("Zoho PageLoad has not been received yet.");
+}
 
       const repeatedNow = isRepeatedQuestion(question);
       const frustrationNow = hasFrustrationPhrase(question);
@@ -966,25 +969,29 @@
       }
     });
 
-    if (window.ZOHO?.embeddedApp) {
-      ZOHO.embeddedApp.on("PageLoad", async function (entity) {
-  try {
-    // ... existing PageLoad code ...
+    let pageLoadReceived = false;
 
-    // Dashboard widgets ke liye height explicitly set karna zaroori hai
-    if (window.ZOHO?.CRM?.UI?.Resize) {
-      await ZOHO.CRM.UI.Resize({ height: "600", width: "100%" });
-    }
-  } catch (error) {
-    ...
-  }
-});
+if (window.ZOHO?.embeddedApp) {
+  ZOHO.embeddedApp.on("PageLoad", async function (entity) {
+    pageLoadReceived = true;
+    state.entity = entity || {};
+    setStatus("Loading CRM context");
+    state.crmContext = await buildCrmContext(state.entity);
+    setStatus(`Loaded ${state.crmContext.entity || "record"}`);
+  });
 
-ZOHO.embeddedApp.init();
-    } else {
-      setStatus("Zoho SDK missing");
-      appendMetaMessage("Open this widget inside Zoho CRM to use the embedded SDK.");
+  ZOHO.embeddedApp.init();
+
+  // Agar 2 second mein PageLoad nahi aaya, maan lo global context hai (no record).
+  setTimeout(() => {
+    if (!pageLoadReceived) {
+      state.entity = {};
+      state.crmContext = { entity: "", record_id: "", record: {}, module_meta: {} };
+      setStatus("Global assistant ready");
+      appendMetaMessage("No specific record — ask me anything about your CRM.");
     }
+  }, 2000);
+}
 
     appendAssistantBlock("Ask a CRM question. I will use the current record context first and only escalate when the thread stays unresolved.");
   </script>

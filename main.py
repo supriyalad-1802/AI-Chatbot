@@ -18,22 +18,21 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 
-# NOTE: llama-3.3-70b-versatile was deprecated by Groq on 2026-06-17.
-# openai/gpt-oss-120b is the recommended replacement for general-purpose use.
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_GROQ_MODEL = "gpt-oss-120b"  # Cerebras naming — no "openai/" prefix
 DEFAULT_GROQ_ENDPOINT = "https://api.cerebras.ai/v1/chat/completions"
 DEFAULT_DESK_BASE_URL = "https://desk.zoho.in/api/v1"
+DEFAULT_CRM_BASE_URL = "https://www.zohoapis.in/crm/v2"
 DEFAULT_ZOHO_OAUTH_TOKEN_URL = "https://accounts.zoho.in/oauth/v2/token"
 DEFAULT_SERPER_ENDPOINT = "https://google.serper.dev/search"
 MAX_TOOL_CALL_ROUNDS = 4
+CRM_SEARCHABLE_MODULES = ("Leads", "Deals", "Contacts", "Accounts")
 
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
-app = FastAPI(
-    title="Zoho CRM Widget AI Backend",
-    version="3.0.0",
-)
+app = FastAPI(title="Zoho CRM Widget AI Backend", version="4.0.0")
 
+# Wide-open CORS: this widget is embedded inside Zoho CRM iframes served from
+# dynamically-generated Zoho domains, so a fixed origin allowlist is impractical.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,10 +41,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory cache for the Zoho Desk access token so we don't need to
-# hand-paste a fresh token from the console every ~10 minutes.
-_current_access_token: Optional[str] = None
-_token_expiry_time: Optional[datetime] = None
+# In-memory token caches so we don't hand-refresh tokens from the console.
+_desk_access_token: Optional[str] = None
+_desk_token_expiry: Optional[datetime] = None
+_crm_access_token: Optional[str] = None
+_crm_token_expiry: Optional[datetime] = None
 
 
 class HistoryMessage(BaseModel):
@@ -79,24 +79,19 @@ async def generic_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"error": f"Internal server error: {exc}"})
 
 
+# ---------------------------------------------------------------------------
+# Small shared helpers
+# ---------------------------------------------------------------------------
+
 def load_env_value(name: str, default: Optional[str] = None) -> Optional[str]:
     value = os.getenv(name)
-    if value is None or value == "":
-        if ENV_PATH.exists():
-            file_values = dotenv_values(ENV_PATH)
-            file_value = file_values.get(name)
-            if file_value not in (None, ""):
-                return str(file_value)
-        return default
-    return value
-
-
-def safe_json(response: requests.Response) -> Optional[Any]:
-    try:
-        return response.json()
-    except ValueError:
-        return None
-    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False)
+    if value:
+        return value
+    if ENV_PATH.exists():
+        file_value = dotenv_values(ENV_PATH).get(name)
+        if file_value:
+            return str(file_value)
+    return default
 
 
 def json_dumps_compact(value: Any) -> str:
@@ -104,22 +99,78 @@ def json_dumps_compact(value: Any) -> str:
 
 
 def safe_strip(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
+    return str(value).strip() if value is not None else ""
 
 
-def first_present(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
-    for key in keys:
-        value = data.get(key)
-        if value not in (None, ""):
-            return value
-    return None
+def safe_json(response: requests.Response) -> Optional[Any]:
+    try:
+        return response.json()
+    except ValueError:
+        return None
 
 
 def normalize_history(history: list[HistoryMessage]) -> list[dict[str, str]]:
-    trimmed = history[-6:]  # keep token usage down; recent context is what matters most
-    return [{"role": item.role, "content": item.content} for item in trimmed]
+    return [{"role": m.role, "content": m.content} for m in history[-6:]]  # keep token usage down
+
+
+def parse_retry_after_seconds(response: requests.Response, default: float) -> float:
+    message = (safe_json(response) or {}).get("error", {}).get("message", "")
+    match = re.search(r"try again in ([\d.]+)s", message)
+    return float(match.group(1)) + 0.5 if match else default
+
+
+# ---------------------------------------------------------------------------
+# OAuth token refresh — Desk and CRM are separate scopes/tokens
+# ---------------------------------------------------------------------------
+
+def _refresh_zoho_token(client_id_key: str, client_secret_key: str, refresh_token_key: str) -> tuple[str, datetime]:
+    client_id = load_env_value(client_id_key)
+    client_secret = load_env_value(client_secret_key)
+    refresh_token = load_env_value(refresh_token_key)
+
+    if not all([client_id, client_secret, refresh_token]):
+        raise HTTPException(status_code=500, detail=f"{client_id_key}, {client_secret_key}, {refresh_token_key} must be configured")
+
+    try:
+        response = requests.post(
+            DEFAULT_ZOHO_OAUTH_TOKEN_URL,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh Zoho token: {e}")
+
+    access_token = token_data.get("access_token")
+    expires_in = token_data.get("expires_in")
+    if not isinstance(access_token, str) or not access_token or not isinstance(expires_in, (int, float)):
+        raise HTTPException(status_code=500, detail=f"Zoho token refresh response malformed: {token_data}")
+
+    return access_token, datetime.now() + timedelta(seconds=expires_in - 300)
+
+
+def get_valid_desk_access_token() -> str:
+    global _desk_access_token, _desk_token_expiry
+    if not _desk_access_token or not _desk_token_expiry or datetime.now() >= _desk_token_expiry:
+        _desk_access_token, _desk_token_expiry = _refresh_zoho_token(
+            "ZOHO_DESK_CLIENT_ID", "ZOHO_DESK_CLIENT_SECRET", "ZOHO_DESK_REFRESH_TOKEN"
+        )
+    return _desk_access_token
+
+
+def get_valid_crm_access_token() -> str:
+    global _crm_access_token, _crm_token_expiry
+    if not _crm_access_token or not _crm_token_expiry or datetime.now() >= _crm_token_expiry:
+        _crm_access_token, _crm_token_expiry = _refresh_zoho_token(
+            "ZOHO_CRM_CLIENT_ID", "ZOHO_CRM_CLIENT_SECRET", "ZOHO_CRM_REFRESH_TOKEN"
+        )
+    return _crm_access_token
 
 
 # ---------------------------------------------------------------------------
@@ -132,17 +183,11 @@ ZOHO_DOCS_TOOL = {
         "name": "search_zoho_docs",
         "description": (
             "Search Zoho CRM's official help documentation for general how-to and configuration "
-            "questions (e.g. workflow rules, roles, sharing rules, field types) that are not answered "
-            "by the current record's data."
+            "questions (workflow rules, roles, sharing rules, field types, etc.)."
         ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query, e.g. 'how to create a workflow rule'",
-                }
-            },
+            "properties": {"query": {"type": "string", "description": "e.g. 'how to create a workflow rule'"}},
             "required": ["query"],
         },
     },
@@ -167,66 +212,109 @@ def search_zoho_docs(query: str) -> str:
     if not response.ok:
         return f"Documentation search failed: {response.status_code}"
 
-    results = response.json().get("organic", [])[:3]
+    results = (safe_json(response) or {}).get("organic", [])[:3]
     if not results:
         return "No relevant documentation found for this query."
 
-    return "\n\n".join(
-        f"{r.get('title', '')}: {r.get('snippet', '')} ({r.get('link', '')})" for r in results
-    )
-
-
-def execute_tool_call(name: str, arguments: dict[str, Any]) -> str:
-    if name == "search_zoho_docs":
-        return search_zoho_docs(arguments.get("query", ""))
-    return f"Unknown tool: {name}"
+    return "\n\n".join(f"{r.get('title', '')}: {r.get('snippet', '')} ({r.get('link', '')})" for r in results)
 
 
 # ---------------------------------------------------------------------------
-# Groq chat completion with tool-calling
+# Tool: live Zoho CRM record search
+# ---------------------------------------------------------------------------
+
+CRM_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_crm_records",
+        "description": (
+            "Search live Zoho CRM data by name, company, or email to answer questions about a "
+            "specific Lead, Deal, Contact, or Account. If you're not sure which module the user "
+            "means, ask them to clarify before calling this tool rather than guessing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string", "description": "One of: Leads, Deals, Contacts, Accounts"},
+                "search_term": {"type": "string", "description": "Name, company, or email to search for"},
+            },
+            "required": ["module", "search_term"],
+        },
+    },
+}
+
+
+def search_crm_records(module: str, search_term: str) -> str:
+    if module not in CRM_SEARCHABLE_MODULES:
+        return f"'{module}' is not a searchable module. Use one of: {', '.join(CRM_SEARCHABLE_MODULES)}."
+
+    try:
+        response = requests.get(
+            f"{DEFAULT_CRM_BASE_URL}/{module}/search",
+            headers={"Authorization": f"Zoho-oauthtoken {get_valid_crm_access_token()}"},
+            params={"word": search_term},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        return f"CRM search failed: {e}"
+
+    if response.status_code == 204 or not response.ok:
+        return f"No matching {module} record found for '{search_term}'."
+
+    records = (safe_json(response) or {}).get("data", [])[:3]
+    return json_dumps_compact(records) if records else f"No matching {module} record found for '{search_term}'."
+
+
+TOOL_EXECUTORS = {
+    "search_zoho_docs": lambda args: search_zoho_docs(args.get("query", "")),
+    "search_crm_records": lambda args: search_crm_records(args.get("module", ""), args.get("search_term", "")),
+}
+ALL_TOOLS = [ZOHO_DOCS_TOOL, CRM_SEARCH_TOOL]
+
+
+def execute_tool_call(name: str, arguments: dict[str, Any]) -> str:
+    executor = TOOL_EXECUTORS.get(name)
+    return executor(arguments) if executor else f"Unknown tool: {name}"
+
+
+# ---------------------------------------------------------------------------
+# Chat completion (Cerebras, OpenAI-compatible) with tool-calling
 # ---------------------------------------------------------------------------
 
 def build_chat_messages(question: str, crm_context: dict[str, Any], history: list[HistoryMessage]) -> list[dict[str, Any]]:
     system_prompt = (
         "You are a support assistant for our Zoho CRM users. "
-        "For greetings, small talk, or questions about what you can help with, respond naturally and briefly "
-        "explain you can answer questions about the current CRM record and general CRM configuration topics. "
-        "For questions about the current record, use the CRM context JSON provided below. "
-        "For general 'how do I configure/use X in Zoho CRM' questions not answered by the record context, "
-        "call the search_zoho_docs tool to find the real answer before responding — do not guess. "
-        "Never invent CRM facts, field names, or configuration details. If a factual question remains "
-        "unanswered after checking context and searching docs, say you don't know. "
+        "For greetings or meta-questions, respond naturally and briefly explain what you can help with. "
+        "If CRM context for the current record is provided below and non-empty, use it for record-specific questions. "
+        "If no record context is provided, or the user asks about a different record, use the search_crm_records "
+        "tool to look up live data by name, company, or email. "
+        "For general 'how do I configure/use X in Zoho CRM' questions, use the search_zoho_docs tool. "
+        "Never invent CRM facts, field names, or configuration details — if a factual question remains "
+        "unanswered after checking context and searching, say you don't know. "
         "Give your final answer as plain text, not JSON or any structured format. "
         "On the very last line of your final answer, write exactly RESOLVED: true if your answer fully "
-        "addresses the question, or RESOLVED: false if it does not (e.g. you said you don't know, or the "
-        "request needs a human/support action you cannot perform)."
+        "addresses the question, or RESOLVED: false if it does not."
     )
 
-    user_prompt = [
+    user_prompt = "\n\n".join([
         f"Question:\n{question}",
-        "CRM context JSON:\n" + json_dumps_compact(crm_context),
+        "CRM context JSON (current record, if any):\n" + json_dumps_compact(crm_context),
         "Conversation history JSON:\n" + json_dumps_compact(normalize_history(history)),
-    ]
+    ])
 
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "\n\n".join(user_prompt)},
+        {"role": "user", "content": user_prompt},
     ]
 
 
 def parse_chat_response(content: str) -> dict[str, Any]:
     text = content.strip()
-    resolved = False
-
     match = re.search(r"RESOLVED:\s*(true|false)\s*$", text, flags=re.IGNORECASE)
+    resolved = match.group(1).lower() == "true" if match else False
     if match:
-        resolved = match.group(1).lower() == "true"
         text = text[: match.start()].strip()
-
-    if not text:
-        text = "I don't know based on the provided CRM data."
-
-    return {"answer": text, "resolved": resolved}
+    return {"answer": text or "I don't know based on the provided CRM data.", "resolved": resolved}
 
 
 def groq_chat_completion(question: str, crm_context: dict[str, Any], history: list[HistoryMessage]) -> dict[str, Any]:
@@ -242,17 +330,8 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
         for attempt in range(6):
             response = requests.post(
                 DEFAULT_GROQ_ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-                json={
-                    "model": model_name,
-                    "messages": messages,
-                    "tools": [ZOHO_DOCS_TOOL],
-                    "temperature": 0.2,
-                },
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model_name, "messages": messages, "tools": ALL_TOOLS, "temperature": 0.2},
                 timeout=45,
             )
             if response.status_code != 429:
@@ -260,114 +339,45 @@ def groq_chat_completion(question: str, crm_context: dict[str, Any], history: li
             time.sleep(min(parse_retry_after_seconds(response, default=3.0 * (attempt + 1)), 20.0))
 
         if not response.ok:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Groq request failed: {response.status_code} {response.text}",
-            )
+            raise HTTPException(status_code=500, detail=f"Chat model request failed: {response.status_code} {response.text}")
 
-        payload = response.json()
-        choices = payload.get("choices") if isinstance(payload, dict) else None
-        if not isinstance(choices, list) or not choices:
-            raise HTTPException(status_code=500, detail="Groq response did not include any choices")
+        payload = safe_json(response) or {}
+        choices = payload.get("choices") or []
+        if not choices:
+            raise HTTPException(status_code=500, detail="Chat model response did not include any choices")
 
-        choice = choices[0]
-        message = choice.get("message", {}) if isinstance(choice, dict) else {}
+        message = choices[0].get("message", {})
         tool_calls = message.get("tool_calls")
 
         if not tool_calls:
-            content = first_present(message if isinstance(message, dict) else {}, ("content",))
+            content = message.get("content")
             if not isinstance(content, str):
-                raise HTTPException(status_code=500, detail="Groq response did not include message content")
+                raise HTTPException(status_code=500, detail="Chat model response did not include message content")
             return parse_chat_response(content)
 
-        # Model wants to call a tool: append its request, execute, append the result, loop again.
         messages.append(message)
         for call in tool_calls:
             function_info = call.get("function", {})
-            tool_name = function_info.get("name", "")
             try:
                 tool_args = json.loads(function_info.get("arguments") or "{}")
             except json.JSONDecodeError:
                 tool_args = {}
-
-            tool_result = execute_tool_call(tool_name, tool_args)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.get("id", ""),
-                    "content": tool_result,
-                }
-            )
+            result = execute_tool_call(function_info.get("name", ""), tool_args)
+            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
 
     raise HTTPException(status_code=500, detail="Too many tool-call rounds without a final answer")
 
 
-def parse_retry_after_seconds(response: requests.Response, default: float) -> float:
-    message = (safe_json(response) or {}).get("error", {}).get("message", "")
-    match = re.search(r"try again in ([\d.]+)s", message)
-    return float(match.group(1)) + 0.5 if match else default
-    """Exchange the long-lived refresh token for a fresh short-lived access token
-    and cache it in memory along with its expiry time."""
-    global _current_access_token, _token_expiry_time
-
-    client_id = load_env_value("ZOHO_DESK_CLIENT_ID")
-    client_secret = load_env_value("ZOHO_DESK_CLIENT_SECRET")
-    refresh_token = load_env_value("ZOHO_DESK_REFRESH_TOKEN")
-
-    if not all([client_id, client_secret, refresh_token]):
-        raise HTTPException(
-            status_code=500,
-            detail="ZOHO_DESK_CLIENT_ID, ZOHO_DESK_CLIENT_SECRET, and ZOHO_DESK_REFRESH_TOKEN must be configured for token refresh.",
-        )
-
-    refresh_payload = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }
-
-    try:
-        response = requests.post(DEFAULT_ZOHO_OAUTH_TOKEN_URL, data=refresh_payload, timeout=30)
-        response.raise_for_status()
-        token_data = response.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Failed to refresh Zoho access token: {e}")
-
-    new_access_token = token_data.get("access_token")
-    expires_in = token_data.get("expires_in")
-
-    if not isinstance(new_access_token, str) or not new_access_token:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Zoho token refresh response did not include access_token. Full response: {token_data}",
-        )
-    if not isinstance(expires_in, (int, float)):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Zoho token refresh response did not include expires_in. Full response: {token_data}",
-        )
-
-    _current_access_token = new_access_token
-    # Refresh 5 minutes before actual expiry to avoid using a token that expires mid-request.
-    _token_expiry_time = datetime.now() + timedelta(seconds=expires_in - 300)
-
-
-def get_valid_access_token() -> str:
-    """Returns a cached access token, refreshing it first if missing or close to expiry."""
-    if not _current_access_token or not _token_expiry_time or datetime.now() >= _token_expiry_time:
-        refresh_zoho_access_token()
-    assert _current_access_token is not None
-    return _current_access_token
-
+# ---------------------------------------------------------------------------
+# Zoho Desk: contact + ticket creation
+# ---------------------------------------------------------------------------
 
 def desk_headers() -> dict[str, str]:
     org_id = load_env_value("ZOHO_DESK_ORG_ID")
     if not org_id:
         raise HTTPException(status_code=500, detail="ZOHO_DESK_ORG_ID must be configured")
-
     return {
-        "Authorization": f"Zoho-oauthtoken {get_valid_access_token()}",
+        "Authorization": f"Zoho-oauthtoken {get_valid_desk_access_token()}",
         "orgId": org_id,
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -378,19 +388,11 @@ def desk_base_url() -> str:
     return safe_strip(load_env_value("ZOHO_DESK_BASE_URL", DEFAULT_DESK_BASE_URL)) or DEFAULT_DESK_BASE_URL
 
 
-def resolve_department_id(explicit_department_id: Optional[str]) -> str:
-    department_id = safe_strip(explicit_department_id)
-    if department_id:
-        return department_id
-
-    fallback_department_id = safe_strip(load_env_value("ZOHO_DESK_DEFAULT_DEPARTMENT_ID"))
-    if fallback_department_id:
-        return fallback_department_id
-
-    raise HTTPException(
-        status_code=400,
-        detail="department_id is required. Set ZOHO_DESK_DEFAULT_DEPARTMENT_ID or pass department_id in the request.",
-    )
+def resolve_department_id(explicit: Optional[str]) -> str:
+    department_id = safe_strip(explicit) or safe_strip(load_env_value("ZOHO_DESK_DEFAULT_DEPARTMENT_ID"))
+    if not department_id:
+        raise HTTPException(status_code=400, detail="department_id is required (set ZOHO_DESK_DEFAULT_DEPARTMENT_ID or pass it explicitly).")
+    return department_id
 
 
 def search_desk_contact(contact_email: str) -> Optional[str]:
@@ -400,15 +402,8 @@ def search_desk_contact(contact_email: str) -> Optional[str]:
         params={"module": "contacts", "searchStr": contact_email},
         timeout=30,
     )
-
-    if response.status_code == 404:
+    if response.status_code == 404 or not response.ok:
         return None
-
-    if not response.ok:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Zoho Desk contact search failed: {response.status_code} {response.text}",
-        )
 
     payload = safe_json(response)
     if payload is None:
@@ -417,9 +412,8 @@ def search_desk_contact(contact_email: str) -> Optional[str]:
     candidates: list[Any] = []
     if isinstance(payload, dict):
         for key in ("data", "contacts", "results"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                candidates.extend(value)
+            if isinstance(payload.get(key), list):
+                candidates.extend(payload[key])
     elif isinstance(payload, list):
         candidates.extend(payload)
 
@@ -432,89 +426,51 @@ def search_desk_contact(contact_email: str) -> Optional[str]:
         contact_id = candidate.get("id") or candidate.get("contactId")
         if contact_id:
             return str(contact_id)
-
     return None
 
 
 def create_desk_contact(contact_email: str) -> str:
-    local_part = contact_email.split("@", 1)[0].strip() or "Zoho CRM User"
-    contact_payload = {
-        "email": contact_email,
-        "lastName": local_part,
-    }
-
     response = requests.post(
         f"{desk_base_url()}/contacts",
         headers=desk_headers(),
-        json=contact_payload,
+        json={"email": contact_email, "lastName": contact_email.split("@", 1)[0].strip() or "Zoho CRM User"},
         timeout=30,
     )
-
     if not response.ok:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Zoho Desk contact creation failed: {response.status_code} {response.text}",
-        )
+        raise HTTPException(status_code=500, detail=f"Zoho Desk contact creation failed: {response.status_code} {response.text}")
 
     payload = safe_json(response)
-    if payload is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Zoho Desk contact creation returned a non-JSON response: {response.text}",
-        )
-    contact_id = None
-    if isinstance(payload, dict):
-        contact_id = payload.get("id") or payload.get("contactId")
-
+    contact_id = payload.get("id") or payload.get("contactId") if isinstance(payload, dict) else None
     if not contact_id:
         raise HTTPException(status_code=500, detail="Zoho Desk contact creation did not return a contact id")
-
     return str(contact_id)
 
 
 def resolve_desk_contact_id(contact_email: str) -> str:
-    contact_id = search_desk_contact(contact_email)
-    if contact_id:
-        return contact_id
-    return create_desk_contact(contact_email)
+    return search_desk_contact(contact_email) or create_desk_contact(contact_email)
 
 
 def create_desk_ticket(subject: str, description: str, contact_email: str, department_id: Optional[str]) -> dict[str, Any]:
-    contact_id = resolve_desk_contact_id(contact_email)
-    resolved_department_id = resolve_department_id(department_id)
-
-    ticket_payload = {
-        "subject": subject.strip(),
-        "description": description.strip(),
-        "contactId": contact_id,
-        "departmentId": resolved_department_id,
-    }
-
     response = requests.post(
         f"{desk_base_url()}/tickets",
         headers=desk_headers(),
-        json=ticket_payload,
+        json={
+            "subject": subject.strip(),
+            "description": description.strip(),
+            "contactId": resolve_desk_contact_id(contact_email),
+            "departmentId": resolve_department_id(department_id),
+        },
         timeout=30,
     )
-
     if not response.ok:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Zoho Desk ticket creation failed: {response.status_code} {response.text}",
-        )
+        raise HTTPException(status_code=500, detail=f"Zoho Desk ticket creation failed: {response.status_code} {response.text}")
 
     payload = safe_json(response)
     if payload is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Zoho Desk ticket creation returned a non-JSON response: {response.text}",
-        )
-    ticket_id = None
-    ticket_number = None
-    if isinstance(payload, dict):
-        ticket_id = payload.get("id") or payload.get("ticketId")
-        ticket_number = payload.get("ticketNumber") or payload.get("number")
+        raise HTTPException(status_code=500, detail=f"Zoho Desk ticket creation returned a non-JSON response: {response.text}")
 
+    ticket_id = payload.get("id") or payload.get("ticketId") if isinstance(payload, dict) else None
+    ticket_number = payload.get("ticketNumber") or payload.get("number") if isinstance(payload, dict) else None
     return {
         "ticket_id": str(ticket_id) if ticket_id is not None else None,
         "ticket_number": str(ticket_number) if ticket_number is not None else None,
@@ -542,9 +498,4 @@ async def chat_endpoint(payload: ChatRequest) -> dict[str, Any]:
 
 @app.post("/create-ticket")
 async def create_ticket_endpoint(payload: CreateTicketRequest) -> dict[str, Any]:
-    return create_desk_ticket(
-        payload.subject,
-        payload.description,
-        payload.contact_email,
-        payload.department_id,
-    )
+    return create_desk_ticket(payload.subject, payload.description, payload.contact_email, payload.department_id)
