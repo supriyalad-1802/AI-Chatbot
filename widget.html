@@ -968,19 +968,19 @@
 
     if (window.ZOHO?.embeddedApp) {
       ZOHO.embeddedApp.on("PageLoad", async function (entity) {
-        try {
-          state.entity = entity || {};
-          setStatus("Loading CRM context");
-          state.crmContext = await buildCrmContext(state.entity);
-          setStatus(`Loaded ${state.crmContext.entity || "record"}`);
-          appendMetaMessage("Zoho PageLoad initialized. Live CRM context is ready.");
-        } catch (error) {
-          setStatus("CRM context unavailable");
-          appendMetaMessage(`Could not load CRM context: ${error?.message || error}`);
-        }
-      });
+  try {
+    // ... existing PageLoad code ...
 
-      ZOHO.embeddedApp.init();
+    // Dashboard widgets ke liye height explicitly set karna zaroori hai
+    if (window.ZOHO?.CRM?.UI?.Resize) {
+      await ZOHO.CRM.UI.Resize({ height: "600", width: "100%" });
+    }
+  } catch (error) {
+    ...
+  }
+});
+
+ZOHO.embeddedApp.init();
     } else {
       setStatus("Zoho SDK missing");
       appendMetaMessage("Open this widget inside Zoho CRM to use the embedded SDK.");
