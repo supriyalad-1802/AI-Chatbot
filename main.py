@@ -289,11 +289,102 @@ def search_crm_records(module: str, search_term: str) -> str:
     return json_dumps_compact(records) if records else f"No matching {module} record found for '{search_term}'."
 
 
+CRM_FIELDS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_module_fields",
+        "description": "Get the list of fields (including which are custom fields) for a Zoho CRM module.",
+        "parameters": {
+            "type": "object",
+            "properties": {"module": {"type": "string", "description": "One of: Leads, Deals, Contacts, Accounts"}},
+            "required": ["module"],
+        },
+    },
+}
+
+
+def get_module_fields(module: str) -> str:
+    if module not in CRM_SEARCHABLE_MODULES:
+        return f"'{module}' is not a valid module. Use one of: {', '.join(CRM_SEARCHABLE_MODULES)}."
+
+    try:
+        response = requests.get(
+            "https://www.zohoapis.in/crm/v2/settings/fields",
+            headers={"Authorization": f"Zoho-oauthtoken {get_valid_crm_access_token()}"},
+            params={"module": module},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        return f"Fetching field metadata failed: {e}"
+
+    if not response.ok:
+        return f"Could not fetch fields for {module}."
+
+    fields = (safe_json(response) or {}).get("fields", [])
+    summary = [
+        {"label": f.get("field_label"), "api_name": f.get("api_name"), "custom_field": f.get("custom_field", False)}
+        for f in fields
+    ]
+    return json_dumps_compact(summary)
+
+
+CRM_AGGREGATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "count_crm_records",
+        "description": (
+            "Count records in a module, optionally grouped by a field — for questions like "
+            "'how many leads are there' or 'what is the status breakdown of leads'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string", "description": "One of: Leads, Deals, Contacts, Accounts"},
+                "group_by_field": {
+                    "type": "string",
+                    "description": "Optional API field name to group by, e.g. 'Lead_Status'. Omit for a simple total count.",
+                },
+            },
+            "required": ["module"],
+        },
+    },
+}
+
+
+def count_crm_records(module: str, group_by_field: str = "") -> str:
+    if module not in CRM_SEARCHABLE_MODULES:
+        return f"'{module}' is not a valid module. Use one of: {', '.join(CRM_SEARCHABLE_MODULES)}."
+
+    query = (
+        f"select {group_by_field}, count(id) from {module} group by {group_by_field} limit 50"
+        if group_by_field
+        else f"select count(id) from {module}"
+    )
+
+    try:
+        response = requests.post(
+            "https://www.zohoapis.in/crm/v2/coql",
+            headers={"Authorization": f"Zoho-oauthtoken {get_valid_crm_access_token()}", "Content-Type": "application/json"},
+            json={"select_query": query},
+            timeout=20,
+        )
+    except requests.exceptions.RequestException as e:
+        return f"Count query failed: {e}"
+
+    if not response.ok:
+        return f"Count query failed: {response.status_code} {response.text}"
+
+    data = (safe_json(response) or {}).get("data", [])
+    return json_dumps_compact(data) if data else "No records found."
+
+
 TOOL_EXECUTORS = {
     "search_zoho_docs": lambda args: search_zoho_docs(args.get("query", "")),
     "search_crm_records": lambda args: search_crm_records(args.get("module", ""), args.get("search_term", "")),
+    "get_module_fields": lambda args: get_module_fields(args.get("module", "")),
+    "count_crm_records": lambda args: count_crm_records(args.get("module", ""), args.get("group_by_field", "")),
 }
-ALL_TOOLS = [ZOHO_DOCS_TOOL, CRM_SEARCH_TOOL]
+ALL_TOOLS = [ZOHO_DOCS_TOOL, CRM_SEARCH_TOOL, CRM_FIELDS_TOOL, CRM_AGGREGATE_TOOL]
 
 
 def execute_tool_call(name: str, arguments: dict[str, Any]) -> str:
@@ -315,6 +406,8 @@ def build_chat_messages(question: str, crm_context: dict[str, Any], history: lis
         "even if the user's message has extra words mixed in, e.g. 'lead1296219000000600021' → search_term '1296219000000600021'). "
         "For basic conceptual questions you already know the general answer to (e.g. 'what is a workflow rule'), "
         "answer directly from your own knowledge — do not call any tool. "
+        "For 'how many X are there' or 'status breakdown' type questions, use the count_crm_records tool. "
+        "For 'what custom fields exist in X module' type questions, use the get_module_fields tool. "
         "For general 'how do I configure/use X in Zoho CRM' step-by-step questions, use the search_zoho_docs tool. "
         "Never invent CRM facts, field names, or configuration details — if a factual question remains "
         "unanswered after checking context and searching, say you don't know. "

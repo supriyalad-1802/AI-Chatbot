@@ -591,21 +591,40 @@
     }
 
     function appendAssistantBlock(text) {
-      const bubble = document.createElement("div");
-      bubble.className = "message assistant";
+  const bubble = document.createElement("div");
+  bubble.className = "message assistant";
 
-      const body = document.createElement("div");
-      body.className = "assistant-block";
+  const body = document.createElement("div");
+  body.className = "assistant-block";
 
-      const content = document.createElement("div");
-      content.textContent = text;
-      body.appendChild(content);
+  const content = document.createElement("div");
+  content.textContent = text;
+  body.appendChild(content);
 
-      bubble.appendChild(body);
-      feed.appendChild(bubble);
-      scrollToBottom();
-      return { bubble, body, content };
-    }
+  const feedbackRow = document.createElement("div");
+  feedbackRow.style.cssText = "display:flex; gap:8px; margin-top:8px;";
+
+  const thumbsUp = document.createElement("button");
+  thumbsUp.textContent = "👍";
+  thumbsUp.style.cssText = "border:none; background:none; cursor:pointer; font-size:14px;";
+
+  const thumbsDown = document.createElement("button");
+  thumbsDown.textContent = "👎";
+  thumbsDown.style.cssText = "border:none; background:none; cursor:pointer; font-size:14px;";
+  thumbsDown.addEventListener("click", () => {
+    showTicketPrompt("you marked the previous answer as not helpful");
+    openTicketForm(state.lastUnresolvedQuestion || "");
+  });
+
+  feedbackRow.appendChild(thumbsUp);
+  feedbackRow.appendChild(thumbsDown);
+  body.appendChild(feedbackRow);
+
+  bubble.appendChild(body);
+  feed.appendChild(bubble);
+  scrollToBottom();
+  return { bubble, body, content };
+}
 
     function appendMetaMessage(text) {
       return appendMessage("meta", text);
@@ -752,26 +771,49 @@
       };
     }
 
-    function transcriptToText() {
-      if (!state.history.length) {
-        return "";
-      }
+  function transcriptToText() {
+  const parts = [];
 
-      return state.history
-        .map((item) => `${item.role === "user" ? "User" : "Assistant"}: ${item.content}`)
-        .join("\n\n");
-    }
+  if (state.crmContext?.entity) {
+    parts.push(`Record: ${state.crmContext.entity} (ID: ${state.crmContext.record_id || "N/A"})`);
+    parts.push("");
+  }
+
+  if (state.history.length) {
+    parts.push("Conversation:");
+    state.history.forEach((item, index) => {
+      const turnNumber = Math.floor(index / 2) + 1;
+      const label = item.role === "user" ? `${turnNumber}. Question` : "   Answer";
+      parts.push(`${label}: ${item.content}`);
+    });
+  }
+
+  return parts.join("\n");
+}
 
     function syncTicketFormDefaults(question, assistantText = "") {
-      const currentUser = state.currentUser || {};
-      const email = currentUser.email || currentUser.Email || currentUser.mail || currentUser.primary_email || "";
-      const fallbackSubject = question || state.lastUnresolvedQuestion || "CRM support request";
-      const description = transcriptToText();
+  const currentUser = state.currentUser || {};
+  const email = currentUser.email || currentUser.Email || currentUser.mail || currentUser.primary_email || "";
+  const lastQuestion = state.lastUnresolvedQuestion || question || "CRM support request";
 
-      ticketSubject.value = fallbackSubject;
-      ticketDescription.value = description || assistantText || fallbackSubject;
-      ticketEmail.value = email;
-    }
+  // Subject: short, capitalized, truncated cleanly — not the whole conversation.
+  const cleanSubject = lastQuestion.trim().charAt(0).toUpperCase() + lastQuestion.trim().slice(1);
+  ticketSubject.value = cleanSubject.length > 80 ? cleanSubject.slice(0, 77) + "..." : cleanSubject;
+
+  // Description: just the record context + the specific unresolved Q&A, not the full transcript.
+  const parts = [];
+  if (state.crmContext?.entity) {
+    parts.push(`Record: ${state.crmContext.entity} (ID: ${state.crmContext.record_id || "N/A"})`);
+    parts.push("");
+  }
+  parts.push(`Question: ${lastQuestion}`);
+  if (assistantText) {
+    parts.push(`Assistant's response: ${assistantText}`);
+  }
+  ticketDescription.value = parts.join("\n");
+
+  ticketEmail.value = email;
+  }
 
     function showTicketPrompt(reason = "") {
       state.ticketPromptVisible = true;
@@ -830,7 +872,7 @@
       appendMessage("user", question);
       state.history.push({ role: "user", content: question });
 
-      const typingBubble = appendMessage("assistant", "Reviewing live Zoho CRM context...", "typing");
+      const typingBubble = appendMessage("assistant", "Thinking...", "typing");
 
       try {
         if (!state.entity) {
@@ -877,9 +919,8 @@
           state.lastUnresolvedQuestion = question;
         }
 
-        const reason = shouldRevealTicketPrompt(resolved, repeatedNow, frustrationNow);
-        if (!state.ticketPromptVisible && reason) {
-          showTicketPrompt(reason);
+       if (!state.ticketPromptVisible) {
+  showTicketPrompt("you can create a ticket anytime if this doesn't fully resolve your issue");
         }
 
         if (state.ticketPromptVisible) {
@@ -994,6 +1035,7 @@ if (window.ZOHO?.embeddedApp) {
 }
 
     appendAssistantBlock("Ask a CRM question. I will use the current record context first and only escalate when the thread stays unresolved.");
+    showTicketPrompt("you can create a ticket anytime");
   </script>
 </body>
 </html>
