@@ -378,59 +378,7 @@ def count_crm_records(module: str, group_by_field: str = "") -> str:
     return json_dumps_compact(data) if data else "No records found."
 
 
-CRM_AUTOMATION_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_automation_settings",
-        "description": (
-            "Get the actual configured automation for a module in this CRM org — workflow rules, "
-            "blueprints, or assignment rules. Use this for 'what rule is configured' or 'is there any "
-            "automation set up for X' questions, as opposed to general how-to questions."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "automation_type": {
-                    "type": "string",
-                    "description": "One of: workflow_rules, blueprint, assignment_rules",
-                },
-                "module": {"type": "string", "description": "One of: Leads, Deals, Contacts, Accounts"},
-            },
-            "required": ["automation_type", "module"],
-        },
-    },
-}
-
-AUTOMATION_ENDPOINTS = {
-    "workflow_rules": "https://www.zohoapis.in/crm/v2/settings/automation/workflow_rules",
-    "blueprint": "https://www.zohoapis.in/crm/v2/settings/blueprint",
-    "assignment_rules": "https://www.zohoapis.in/crm/v2/settings/automation/assignment_rules",
-}
-
-
-def get_automation_settings(automation_type: str, module: str) -> str:
-    endpoint = AUTOMATION_ENDPOINTS.get(automation_type)
-    if not endpoint:
-        return f"'{automation_type}' is not valid. Use one of: {', '.join(AUTOMATION_ENDPOINTS)}."
-    if module not in CRM_SEARCHABLE_MODULES:
-        return f"'{module}' is not a valid module. Use one of: {', '.join(CRM_SEARCHABLE_MODULES)}."
-
-    try:
-        response = requests.get(
-            endpoint,
-            headers={"Authorization": f"Zoho-oauthtoken {get_valid_crm_access_token()}"},
-            params={"module": module},
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        return f"Fetching {automation_type} failed: {e}"
-
-    if not response.ok:
-        return f"No {automation_type} configured for {module}, or access is restricted."
-
-    data = safe_json(response) or {}
-    items = data.get(automation_type) or data.get("blueprint") or []
-    return json_dumps_compact(items) if items else f"No {automation_type} configured for {module}."
+TOOL_EXECUTORS = {
     "search_zoho_docs": lambda args: search_zoho_docs(args.get("query", "")),
     "search_crm_records": lambda args: search_crm_records(args.get("module", ""), args.get("search_term", "")),
     "get_module_fields": lambda args: get_module_fields(args.get("module", "")),
