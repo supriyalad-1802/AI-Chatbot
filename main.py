@@ -244,14 +244,38 @@ CRM_SEARCH_TOOL = {
 }
 
 
+def extract_record_id(text: str) -> Optional[str]:
+    match = re.search(r"\d{15,19}", text)
+    return match.group(0) if match else None
+
+
 def search_crm_records(module: str, search_term: str) -> str:
     if module not in CRM_SEARCHABLE_MODULES:
         return f"'{module}' is not a searchable module. Use one of: {', '.join(CRM_SEARCHABLE_MODULES)}."
 
+    token = get_valid_crm_access_token()
+
+    # If the search term contains something that looks like a Zoho record ID,
+    # try a direct fetch first — the keyword search endpoint doesn't match on IDs.
+    record_id = extract_record_id(search_term)
+    if record_id:
+        try:
+            direct = requests.get(
+                f"{DEFAULT_CRM_BASE_URL}/{module}/{record_id}",
+                headers={"Authorization": f"Zoho-oauthtoken {token}"},
+                timeout=15,
+            )
+        except requests.exceptions.RequestException:
+            direct = None
+        if direct is not None and direct.ok:
+            records = (safe_json(direct) or {}).get("data", [])
+            if records:
+                return json_dumps_compact(records[:3])
+
     try:
         response = requests.get(
             f"{DEFAULT_CRM_BASE_URL}/{module}/search",
-            headers={"Authorization": f"Zoho-oauthtoken {get_valid_crm_access_token()}"},
+            headers={"Authorization": f"Zoho-oauthtoken {token}"},
             params={"word": search_term},
             timeout=15,
         )
@@ -287,8 +311,11 @@ def build_chat_messages(question: str, crm_context: dict[str, Any], history: lis
         "For greetings or meta-questions, respond naturally and briefly explain what you can help with. "
         "If CRM context for the current record is provided below and non-empty, use it for record-specific questions. "
         "If no record context is provided, or the user asks about a different record, use the search_crm_records "
-        "tool to look up live data by name, company, or email. "
-        "For general 'how do I configure/use X in Zoho CRM' questions, use the search_zoho_docs tool. "
+        "tool to look up live data by name, company, email, or record ID (pass record IDs through as-is, "
+        "even if the user's message has extra words mixed in, e.g. 'lead1296219000000600021' → search_term '1296219000000600021'). "
+        "For basic conceptual questions you already know the general answer to (e.g. 'what is a workflow rule'), "
+        "answer directly from your own knowledge — do not call any tool. "
+        "For general 'how do I configure/use X in Zoho CRM' step-by-step questions, use the search_zoho_docs tool. "
         "Never invent CRM facts, field names, or configuration details — if a factual question remains "
         "unanswered after checking context and searching, say you don't know. "
         "Give your final answer as plain text, not JSON or any structured format. "
@@ -317,7 +344,27 @@ def parse_chat_response(content: str) -> dict[str, Any]:
     return {"answer": text or "I don't know based on the provided CRM data.", "resolved": resolved}
 
 
+GREETING_PATTERN = re.compile(
+    r"^\s*(hi|hii+|hello+|hey+|good\s*(morning|afternoon|evening)|thanks?|thank\s*you|ok(ay)?|bye)\s*[!.?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def try_fast_path_response(question: str) -> Optional[dict[str, Any]]:
+    """Handle trivial greetings instantly without touching the LLM at all."""
+    if GREETING_PATTERN.match(question):
+        return {
+            "answer": "Hi! I can help with questions about the current CRM record or general Zoho CRM configuration topics — just ask.",
+            "resolved": True,
+        }
+    return None
+
+
 def groq_chat_completion(question: str, crm_context: dict[str, Any], history: list[HistoryMessage]) -> dict[str, Any]:
+    fast_path = try_fast_path_response(question)
+    if fast_path is not None:
+        return fast_path
+
     api_key = load_env_value("CEREBRAS_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="CEREBRAS_API_KEY is not configured")
