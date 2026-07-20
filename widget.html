@@ -759,13 +759,15 @@
         getCurrentUser(),
       ]);
 
+      // Note: the compact field summary lives only under record.fields. We used to
+      // also duplicate it in module_meta.fields, which doubled the payload (and the
+      // input tokens the model reads on every tool-call round) for no benefit.
       return {
         entity: entityName,
         record_id: recordId,
         current_user: summarizeCurrentUser(currentUser),
         module_meta: {
           field_count: Array.isArray(fields) ? fields.length : 0,
-          fields: buildCompactFieldSummary(fields, record),
         },
         record: summarizeCurrentRecord(record, fields, entityName, recordId),
       };
