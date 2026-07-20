@@ -170,6 +170,44 @@
       gap: 10px;
     }
 
+    /* Rendered Markdown answers. Override the bubble's pre-wrap so the HTML
+       block elements control spacing instead of raw source newlines. */
+    .assistant-block .md {
+      white-space: normal;
+    }
+    .assistant-block .md > :first-child {
+      margin-top: 0;
+    }
+    .assistant-block .md > :last-child {
+      margin-bottom: 0;
+    }
+    .assistant-block .md p {
+      margin: 0 0 8px;
+    }
+    .assistant-block .md ul,
+    .assistant-block .md ol {
+      margin: 4px 0 8px;
+      padding-left: 20px;
+    }
+    .assistant-block .md li {
+      margin: 2px 0;
+    }
+    .assistant-block .md strong {
+      font-weight: 600;
+    }
+    .assistant-block .md code {
+      background: rgba(15, 23, 42, 0.07);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 0.92em;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+    .assistant-block .md a {
+      color: #2563eb;
+      text-decoration: underline;
+      word-break: break-all;
+    }
+
     .ticket-panel {
       display: none;
       flex-direction: column;
@@ -482,7 +520,9 @@
   <script>
     const BACKEND_BASE_URL = "https://ai-chatbot-wlk5.onrender.com";
     const CHAT_ENDPOINT = `${BACKEND_BASE_URL}/chat`;
+    const CHAT_STREAM_ENDPOINT = `${BACKEND_BASE_URL}/chat/stream`;
     const CREATE_TICKET_ENDPOINT = `${BACKEND_BASE_URL}/create-ticket`;
+    const FEEDBACK_ENDPOINT = `${BACKEND_BASE_URL}/feedback`;
     const FRUSTRATION_PHRASES = ["still not working", "that didn't help", "that didnt help", "doesn't help", "does not help"];
 
     const feed = document.getElementById("feed");
@@ -590,41 +630,307 @@
       return bubble;
     }
 
-    function appendAssistantBlock(text) {
-  const bubble = document.createElement("div");
-  bubble.className = "message assistant";
+    // Minimal, XSS-safe Markdown renderer for the subset the backend emits
+    // (**bold**, `code`, links, and '-'/'1.' lists). We escape all HTML first,
+    // then re-introduce only the tags we generate ourselves — the model's text
+    // (which can echo CRM/user data) can never inject markup this way. No CDN
+    // library, since the Zoho widget sandbox may block external scripts.
+    function escapeHtml(value) {
+      return String(value == null ? "" : value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
 
-  const body = document.createElement("div");
-  body.className = "assistant-block";
+    function renderInlineMarkdown(text) {
+      let out = escapeHtml(text);
+      // Inline code first, so its contents aren't touched by later rules.
+      out = out.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
+      // [label](https://url)
+      out = out.replace(
+        /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+        (_, label, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`
+      );
+      // Bare URLs (only when not already inside an href="...").
+      out = out.replace(
+        /(^|[\s(])(https?:\/\/[^\s)<]+)/g,
+        (_, pre, url) => `${pre}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
+      );
+      // **bold**
+      out = out.replace(/\*\*([^*]+)\*\*/g, (_, bold) => `<strong>${bold}</strong>`);
+      return out;
+    }
 
-  const content = document.createElement("div");
-  content.textContent = text;
-  body.appendChild(content);
+    function renderMarkdown(text) {
+      const lines = String(text == null ? "" : text).replace(/\r\n/g, "\n").split("\n");
+      const html = [];
+      let listType = null; // "ul" | "ol" | null
+      let paragraph = [];
 
-  const feedbackRow = document.createElement("div");
-  feedbackRow.style.cssText = "display:flex; gap:8px; margin-top:8px;";
+      const flushParagraph = () => {
+        if (paragraph.length) {
+          html.push(`<p>${paragraph.join("<br>")}</p>`);
+          paragraph = [];
+        }
+      };
+      const closeList = () => {
+        if (listType) {
+          html.push(`</${listType}>`);
+          listType = null;
+        }
+      };
 
-  const thumbsUp = document.createElement("button");
-  thumbsUp.textContent = "👍";
-  thumbsUp.style.cssText = "border:none; background:none; cursor:pointer; font-size:14px;";
+      for (const raw of lines) {
+        const line = raw.replace(/\s+$/, "");
+        const heading = /^\s*#{1,6}\s+(.*)$/.exec(line);
+        const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+        const ordered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
 
-  const thumbsDown = document.createElement("button");
-  thumbsDown.textContent = "👎";
-  thumbsDown.style.cssText = "border:none; background:none; cursor:pointer; font-size:14px;";
-  thumbsDown.addEventListener("click", () => {
-    showTicketPrompt("you marked the previous answer as not helpful");
-    openTicketForm(state.lastUnresolvedQuestion || "");
-  });
+        if (heading) {
+          flushParagraph();
+          closeList();
+          html.push(`<p><strong>${renderInlineMarkdown(heading[1])}</strong></p>`);
+        } else if (bullet) {
+          flushParagraph();
+          if (listType !== "ul") { closeList(); html.push("<ul>"); listType = "ul"; }
+          html.push(`<li>${renderInlineMarkdown(bullet[1])}</li>`);
+        } else if (ordered) {
+          flushParagraph();
+          if (listType !== "ol") { closeList(); html.push("<ol>"); listType = "ol"; }
+          html.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`);
+        } else if (line.trim() === "") {
+          flushParagraph();
+          closeList();
+        } else {
+          closeList();
+          paragraph.push(renderInlineMarkdown(line));
+        }
+      }
+      flushParagraph();
+      closeList();
+      return html.join("");
+    }
 
-  feedbackRow.appendChild(thumbsUp);
-  feedbackRow.appendChild(thumbsDown);
-  body.appendChild(feedbackRow);
+    // The backend streams raw model tokens, which end with a "RESOLVED: true/false"
+    // marker it only strips in the final event. Hide it during live rendering so it
+    // never flashes on screen.
+    function stripResolvedMarker(text) {
+      return String(text == null ? "" : text).replace(/\s*RESOLVED:\s*(true|false)?\s*$/i, "");
+    }
 
-  bubble.appendChild(body);
-  feed.appendChild(bubble);
-  scrollToBottom();
-  return { bubble, body, content };
-}
+    // Best-effort: record answer quality on the backend. Never blocks the UI or
+    // throws — if the feedback call fails, the chat carries on unaffected.
+    async function sendFeedback(rating, question, answer) {
+      try {
+        await fetch(FEEDBACK_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rating, question: question || "", answer: answer || "" }),
+        });
+      } catch (error) {
+        console.warn("Feedback submission failed:", error);
+      }
+    }
+
+    // Builds the 👍/👎 row and appends it to an assistant bubble body. getAnswer()
+    // is a callback so the streaming path can report the final text (not a partial
+    // snapshot captured when the row was created).
+    function attachFeedbackRow(body, question, getAnswer) {
+      if (!question) {
+        return; // welcome / system messages get no feedback row
+      }
+
+      const feedbackRow = document.createElement("div");
+      feedbackRow.style.cssText = "display:flex; align-items:center; gap:8px; margin-top:8px;";
+
+      const thumbsUp = document.createElement("button");
+      thumbsUp.textContent = "👍";
+      thumbsUp.title = "Helpful";
+      thumbsUp.style.cssText = "border:none; background:none; cursor:pointer; font-size:14px;";
+
+      const thumbsDown = document.createElement("button");
+      thumbsDown.textContent = "👎";
+      thumbsDown.title = "Not helpful";
+      thumbsDown.style.cssText = "border:none; background:none; cursor:pointer; font-size:14px;";
+
+      const note = document.createElement("span");
+      note.style.cssText = "font-size:12px; color:var(--muted);";
+
+      const lockButtons = (chosen, other) => {
+        thumbsUp.disabled = true;
+        thumbsDown.disabled = true;
+        thumbsUp.style.cursor = "default";
+        thumbsDown.style.cursor = "default";
+        chosen.style.opacity = "1";
+        other.style.opacity = "0.35";
+      };
+
+      thumbsUp.addEventListener("click", () => {
+        lockButtons(thumbsUp, thumbsDown);
+        note.textContent = "Thanks for the feedback!";
+        sendFeedback("up", question, getAnswer());
+      });
+
+      thumbsDown.addEventListener("click", () => {
+        lockButtons(thumbsDown, thumbsUp);
+        note.textContent = "Thanks — you can raise a ticket below.";
+        sendFeedback("down", question, getAnswer());
+        showTicketPrompt("you marked the previous answer as not helpful");
+        openTicketForm(state.lastUnresolvedQuestion || question || "");
+      });
+
+      feedbackRow.appendChild(thumbsUp);
+      feedbackRow.appendChild(thumbsDown);
+      feedbackRow.appendChild(note);
+      body.appendChild(feedbackRow);
+    }
+
+    // Creates an empty assistant bubble whose markdown content is filled in
+    // incrementally as stream tokens arrive.
+    function createAssistantStream() {
+      const bubble = document.createElement("div");
+      bubble.className = "message assistant";
+
+      const body = document.createElement("div");
+      body.className = "assistant-block";
+
+      const content = document.createElement("div");
+      content.className = "md";
+      body.appendChild(content);
+
+      bubble.appendChild(body);
+      feed.appendChild(bubble);
+      scrollToBottom();
+      return { bubble, body, content };
+    }
+
+    function appendAssistantBlock(text, question = "") {
+      const bubble = document.createElement("div");
+      bubble.className = "message assistant";
+
+      const body = document.createElement("div");
+      body.className = "assistant-block";
+
+      const content = document.createElement("div");
+      content.className = "md";
+      content.innerHTML = renderMarkdown(text);
+      body.appendChild(content);
+
+      attachFeedbackRow(body, question, () => text);
+
+      bubble.appendChild(body);
+      feed.appendChild(bubble);
+      scrollToBottom();
+      return { bubble, body, content };
+    }
+
+    // Streams an answer from /chat/stream, rendering markdown live as tokens
+    // arrive. Resolves with { answer, resolved, body } once the stream is done.
+    // Throws BEFORE any content is rendered so the caller can fall back to the
+    // plain /chat endpoint; once tokens have been shown it never throws, keeping
+    // whatever partial answer was produced.
+    async function runStreamingChat(question, crmContext, history, typingBubble) {
+      const response = await fetch(CHAT_STREAM_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, crm_context: crmContext, history }),
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Stream request failed with status ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let answer = "";
+      let resolved = false;
+      let sawToken = false;
+      let block = null;
+      let contentEl = null;
+
+      const ensureBubble = () => {
+        if (!block) {
+          if (typingBubble && typingBubble.isConnected) {
+            typingBubble.remove();
+          }
+          block = createAssistantStream();
+          contentEl = block.content;
+        }
+      };
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+
+          let sep;
+          while ((sep = buffer.indexOf("\n\n")) !== -1) {
+            const rawEvent = buffer.slice(0, sep);
+            buffer = buffer.slice(sep + 2);
+
+            const dataStr = rawEvent
+              .split("\n")
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).trim())
+              .join("");
+            if (!dataStr) {
+              continue;
+            }
+
+            let evt;
+            try {
+              evt = JSON.parse(dataStr);
+            } catch (parseError) {
+              continue; // ignore malformed frames
+            }
+
+            if (evt.type === "token") {
+              sawToken = true;
+              ensureBubble();
+              answer += evt.v || "";
+              contentEl.innerHTML = renderMarkdown(stripResolvedMarker(answer));
+              scrollToBottom();
+            } else if (evt.type === "status") {
+              if (typingBubble && typingBubble.isConnected && !block) {
+                typingBubble.textContent = evt.v || "Working…";
+              } else {
+                setStatus(evt.v || "");
+              }
+            } else if (evt.type === "done") {
+              if (evt.answer != null) {
+                answer = String(evt.answer);
+              }
+              resolved = Boolean(evt.resolved);
+              ensureBubble();
+              contentEl.innerHTML = renderMarkdown(answer);
+              scrollToBottom();
+            } else if (evt.type === "error") {
+              if (!sawToken) {
+                throw new Error(evt.message || "Streaming error");
+              }
+              break; // already showed something; stop with what we have
+            }
+          }
+        }
+      } catch (streamError) {
+        if (!sawToken) {
+          throw streamError; // nothing rendered — let the caller fall back
+        }
+        // Otherwise keep the partial answer already on screen.
+      }
+
+      ensureBubble();
+      answer = stripResolvedMarker(answer).trim();
+      if (!answer) {
+        answer = "I don't know based on the provided CRM data.";
+      }
+      contentEl.innerHTML = renderMarkdown(answer);
+      return { answer, resolved, body: block.body };
+    }
 
     function appendMetaMessage(text) {
       return appendMessage("meta", text);
@@ -885,35 +1191,60 @@
           state.crmContext = await buildCrmContext(state.entity);
         }
 
-        const response = await fetch(CHAT_ENDPOINT, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            question,
-            crm_context: state.crmContext,
-            history: state.history,
-          }),
-        });
+        let answer;
+        let resolved;
+        let feedbackBody = null; // set only on the streamed path (its bubble has no feedback yet)
 
-        let data = {};
         try {
-          data = await response.json();
-        } catch (error) {
-          data = {};
+          // Preferred path: stream the answer token-by-token.
+          const streamed = await runStreamingChat(question, state.crmContext, state.history, typingBubble);
+          answer = streamed.answer;
+          resolved = streamed.resolved;
+          feedbackBody = streamed.body;
+        } catch (streamError) {
+          // Streaming unavailable (endpoint down, no ReadableStream, network) —
+          // fall back to the plain /chat JSON endpoint.
+          console.warn("Streaming unavailable, falling back to /chat:", streamError);
+
+          const response = await fetch(CHAT_ENDPOINT, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              question,
+              crm_context: state.crmContext,
+              history: state.history,
+            }),
+          });
+
+          let data = {};
+          try {
+            data = await response.json();
+          } catch (error) {
+            data = {};
+          }
+
+          if (typingBubble.isConnected) {
+            typingBubble.remove();
+          }
+
+          if (!response.ok) {
+            throw new Error(data?.error || data?.detail || `Chat request failed with status ${response.status}`);
+          }
+
+          answer = String(data.answer || "I don't know based on the provided CRM data.").trim();
+          resolved = Boolean(data.resolved);
+          appendAssistantBlock(answer, question); // adds its own feedback row
         }
 
-        typingBubble.remove();
-
-        if (!response.ok) {
-          throw new Error(data?.error || data?.detail || `Chat request failed with status ${response.status}`);
+        // The streamed bubble is created without feedback; attach it now that the
+        // final answer text is known.
+        if (feedbackBody) {
+          attachFeedbackRow(feedbackBody, question, () => answer);
         }
 
-        const answer = String(data.answer || "I don't know based on the provided CRM data.").trim();
-        const resolved = Boolean(data.resolved);
-
-        appendAssistantBlock(answer);
+        setStatus("");
         state.history.push({ role: "assistant", content: answer });
 
         if (!resolved) {
